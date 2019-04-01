@@ -36,7 +36,7 @@ Both methods are described below, but __the Docker route is recommended__ as the
 #### Dependencies ####
 - Docker
 
-#### Method #### 
+#### Method ####
 1.  Clone `smith`:
 
 `git clone https://github.com/oracle/smith.git`
@@ -56,7 +56,7 @@ smith(){
 }
 ```
 You should now be able to start building microcontainers (see below).
- 
+
 ### Binary `smith` ###
 
 
@@ -75,6 +75,10 @@ To install go run `sudo yum install golang-bin` or `sudo apt install golang-go` 
 
 Go dependencies are vendored in the vendor directory.
 
+To always authenticate the smith docker image against OCIR, you can set the following environment variables within the
+Docker configuration file:
+`ENV IAD_USERNAME="tenant/username"`
+`ENV IAD_AUTHTOKEN="token"`
 ##### Runtime #####
 
 To build from RPMs, `smith` requires:
@@ -96,7 +100,7 @@ Debian/Ubuntu specific instructions (_Here be Dragons_):
 ```
 # Fedora rawhide chroot (which mock uses by default) does not play well with
 # Debian, so point /etc/mock/default.cfg to EPEL 7 (6 on Ubuntu):
-sudo ln -s /etc/mock/epel-7-x86_64.cfg /etc/mock/default.cfg 
+sudo ln -s /etc/mock/epel-7-x86_64.cfg /etc/mock/default.cfg
 ```
 ```
 # rpm on Debian has a patch to macros that messes up mock so undo it. Note
@@ -123,7 +127,7 @@ If your user is not a member of the group mock then add them:
 On Oracle Linux edit your /etc/mock/site-defaults.cfg and add:
 
     config_opts['use_nspawn'] = False
-    
+
 #### Installing `smith` ####
 
 Installing can be done via the Makefile:

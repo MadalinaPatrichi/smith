@@ -9,12 +9,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	gdigest "github.com/opencontainers/go-digest"
+	common "github.com/oracle/oci-go-sdk/common"
 )
 
 // RegistryClient is a type for container image registry clients.
@@ -54,6 +56,15 @@ func parseRepoInfo(remote string, docker bool) (*RepoInfo, error) {
 		r.Auth = "https://auth.docker.io/token"
 		r.Service = "registry.docker.io"
 		r.Docker = true
+	} else if r.Host == "iad.ocir.io" {
+		r.Auth = "https://iad.ocir.io/20180419/docker/token"
+		r.Service = "iad.ocir.io"
+		r.Docker = true
+		if data.User == nil {
+
+			r.Username = os.Getenv("IAD_USERNAME")
+			r.Password = os.Getenv("IAD_AUTHTOKEN")
+		}
 	}
 	if data.User != nil {
 		// get username and password
@@ -88,6 +99,50 @@ func NewRegistryClient(insecure bool) *RegistryClient {
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure},
 	}
 	return &RegistryClient{http.Client{Transport: tr}}
+}
+
+func (r *RegistryClient) SignRequest(info *RepoInfo, request *http.Request) {
+	if info.Host == "iad.ocir.io" {
+		// Set the Date header
+		request.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		// And a provider of cryptographic keys
+		provider := common.DefaultConfigProvider()
+		// Mandatory headers to be used in the sign process
+		defaultGenericHeaders := []string{"date", "(request-target)", "host"}
+
+		// Optional headers
+		optionalHeaders := []string{"content-length", "content-type", "x-content-sha256"}
+
+		// A predicate that specifies when to use the optional signing headers
+		optionalHeadersPredicate := func(re *http.Request) bool {
+			return re.Method == http.MethodPost
+		}
+		// Build the signer
+		signer := common.RequestSignerWithBodyHashingPredicate(provider, defaultGenericHeaders, optionalHeaders, optionalHeadersPredicate)
+		// Sign the request
+		tenancyId, _ := provider.TenancyOCID()
+		logrus.Debugf("Signing request %s", tenancyId)
+		signer.Sign(request)
+	}
+}
+
+func getResponseMessage(response *http.Response) string {
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(response.Body); err != nil {
+		logrus.Warnf("Failed to read response body: %v", err)
+	}
+	return string(buf.Bytes())
+}
+
+func (r *RegistryClient) CheckRedirect(info *RepoInfo, response *http.Response) error {
+	if info.Token != "" {
+		return fmt.Errorf("Token is invalid for %s %s", info.Reponame, getResponseMessage(response))
+	}
+	// we don't have a token so extract auth data
+	if err := extractAuth(response, info); err != nil {
+		return err
+	}
+	return nil
 }
 
 func uploadContainer(inName, remote string, insecure bool, docker bool) bool {
@@ -253,23 +308,15 @@ func (r *RegistryClient) PrepPutObject(info *RepoInfo, path string) (string, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 401 {
-		if info.Token != "" {
-			return "", fmt.Errorf("Token is invalid for %s", info.Reponame)
+		err = r.CheckRedirect(info, resp)
+		if err == nil {
+			return r.PrepPutObject(info, path)
 		}
-		// we don't have a token so extract auth data
-		if err := extractAuth(resp, info); err != nil {
-			return "", err
-		}
-		// try again
-		logrus.Debugf("Retrying %s with a token", path)
-		return r.PrepPutObject(info, path)
+		return "", err
 	} else if resp.StatusCode != 202 {
-		var buf bytes.Buffer
-		if _, err = buf.ReadFrom(resp.Body); err != nil {
-			logrus.Warnf("Failed to read response body: %v", err)
-		}
+		logrus.Debugf("Returned 202 %s", postURL)
 		return "", fmt.Errorf("Blobs post returned invalid response %d:\n%s",
-			resp.StatusCode, string(buf.Bytes()))
+			resp.StatusCode, getResponseMessage(resp))
 	}
 	uploadURL := resp.Header.Get("Location")
 	if uploadURL == "" {
@@ -303,8 +350,7 @@ func (r *RegistryClient) PutObject(info *RepoInfo, path, ct string, data []byte)
 			return err
 		}
 	}
-	u := fmt.Sprintf("%s://%s/v2/%s/%s",
-		info.Scheme, info.Host, info.Reponame, path)
+	u := fmt.Sprintf("%s://%s/v2/%s/%s", info.Scheme, info.Host, info.Reponame, path)
 	if strings.HasPrefix(path, "blobs/") {
 		// check for existing blob
 		logrus.Debugf("Performing HEAD on %s", path)
@@ -323,15 +369,11 @@ func (r *RegistryClient) PutObject(info *RepoInfo, path, ct string, data []byte)
 		// we should have a token by this point, but handle 401
 		// here as well just in case
 		if resp.StatusCode == 401 {
-			if info.Token != "" {
-				return fmt.Errorf("Token is invalid for %s", info.Reponame)
+			err = r.CheckRedirect(info, resp)
+			if err == nil {
+				return r.PutObject(info, path, ct, data)
 			}
-			// we don't have a token so extract auth data
-			if err := extractAuth(resp, info); err != nil {
-				return err
-			}
-			logrus.Debugf("Retrying %s with a token", path)
-			return r.PutObject(info, path, ct, data)
+			return err
 		} else if resp.StatusCode == 200 {
 			// object exists so bail
 			logrus.Infof("Object at %s already exists", path)
@@ -345,12 +387,8 @@ func (r *RegistryClient) PutObject(info *RepoInfo, path, ct string, data []byte)
 			}
 		} else {
 			// something went wrong
-			var buf bytes.Buffer
-			if _, err = buf.ReadFrom(resp.Body); err != nil {
-				logrus.Warnf("Failed to read response body: %v", err)
-			}
 			return fmt.Errorf("Put request returned invalid response %d:\n%s",
-				resp.StatusCode, string(buf.Bytes()))
+				resp.StatusCode, getResponseMessage(resp))
 		}
 	}
 	req, err := http.NewRequest("PUT", u, bytes.NewReader(data))
@@ -368,24 +406,14 @@ func (r *RegistryClient) PutObject(info *RepoInfo, path, ct string, data []byte)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 401 {
-		if info.Token != "" {
-			return fmt.Errorf("Token is invalid for %s", info.Reponame)
+		err = r.CheckRedirect(info, resp)
+		if err == nil {
+			return r.PutObject(info, path, ct, data)
 		}
-		// we don't have a token so extract auth data
-		if err := extractAuth(resp, info); err != nil {
-			return err
-		}
-		logrus.Debugf("Retrying %s with a token", path)
-		return r.PutObject(info, path, ct, data)
+		return err
 	} else if resp.StatusCode != 201 {
-		var buf bytes.Buffer
-		if _, err = buf.ReadFrom(resp.Body); err != nil {
-			logrus.Warnf("Failed to read response body: %v", err)
-		}
-		return fmt.Errorf("Put request returned invalid response %d:\n%s",
-			resp.StatusCode, string(buf.Bytes()))
+		return fmt.Errorf("Put request returned invalid response %d:\n%s", resp.StatusCode, getResponseMessage(resp))
 	}
-	logrus.Infof("Uploaded %s", path)
 	return nil
 }
 
@@ -436,12 +464,8 @@ func (r *RegistryClient) GetObject(info *RepoInfo, path string) ([]byte, error) 
 		logrus.Debugf("Retrying %s with a token", path)
 		return r.GetObject(info, path)
 	} else if resp.StatusCode != 200 {
-		var buf bytes.Buffer
-		if _, err = buf.ReadFrom(resp.Body); err != nil {
-			logrus.Warnf("Failed to read response body: %v", err)
-		}
 		return nil, fmt.Errorf("Get request returned invalid response %d:\n%s",
-			resp.StatusCode, string(buf.Bytes()))
+			resp.StatusCode, getResponseMessage(resp))
 	}
 	var buf bytes.Buffer
 	if _, err = buf.ReadFrom(resp.Body); err != nil {
@@ -478,12 +502,8 @@ func (r *RegistryClient) GetToken(info *RepoInfo, actions []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		var buf bytes.Buffer
-		if _, err = buf.ReadFrom(resp.Body); err != nil {
-			logrus.Warnf("Failed to read response body: %v", err)
-		}
 		return fmt.Errorf("Auth server returned invalid response %d:\n%s",
-			resp.StatusCode, string(buf.Bytes()))
+			resp.StatusCode, getResponseMessage(resp))
 	}
 	tokenResponse := GetTokenResponse{}
 	decoder := json.NewDecoder(resp.Body)

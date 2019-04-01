@@ -20,4 +20,6 @@ VOLUME /write
 
 WORKDIR /write
 
+ENV IAD_USERNAME="tenant/username"
+ENV IAD_AUTHTOKEN="token"
 ENTRYPOINT ["/usr/bin/smith"]
